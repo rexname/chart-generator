@@ -18,8 +18,8 @@ Generates "TradingView-like" charts server-side and returns them as PNG images.
 
 1.  **Clone the repository**
     ```bash
-    git clone <repo_url>
-    cd chart-gen
+    git clone https://github.com/rexname/chart-generator.git
+    cd chart-generator
     ```
 
 2.  **Install Dependencies**
