@@ -13,9 +13,7 @@ Key optimizations:
 """
 
 import asyncio
-import json
 from datetime import datetime
-from functools import lru_cache
 from typing import Optional
 
 import ccxt
@@ -37,14 +35,7 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # Timeframe mappings
 TF_MAP_CCXT = {"M1": "1m", "M15": "15m", "H1": "1h", "H4": "4h", "D": "1d", "W": "1w"}
-TF_MAP_PYTH = {
-    "M1": 60,
-    "M15": 900,
-    "H1": 3600,
-    "H4": 14400,
-    "D": 86400,
-    "W": 604800,
-}
+
 
 # Exchange configs
 EXCHANGE_CONFIGS = [
@@ -69,13 +60,6 @@ COLOR_BG = "#131722"
 COLOR_GRID = "#2a2e39"
 COLOR_TEXT = "#d1d4dc"
 
-# Pyth price IDs
-PYTH_IDS = {
-    "BTC/USD": "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
-    "ETH/USD": "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
-    "SOL/USD": "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
-    "BNB/USD": "2f95862b0455a0920eb43c5d401a8801f16f31f9175d2752187064d7c00650d3",
-}
 
 # ============================================================================
 # CONNECTION POOLING & SESSIONS
@@ -104,16 +88,6 @@ def create_session() -> requests.Session:
 
 # Global session instance
 HTTP_SESSION = create_session()
-
-
-@lru_cache(maxsize=10)
-def get_exchange_instance(exchange_id: str, config_json: str):
-    """Cache exchange instances to avoid re-initialization"""
-    config = json.loads(config_json)
-    config["options"] = config.get("options", {})
-    config["options"]["loadMarkets"] = False  # Skip market metadata load
-    exchange_class = getattr(ccxt, exchange_id)
-    return exchange_class(config)
 
 
 # ============================================================================
@@ -161,21 +135,22 @@ async def fetch_ccxt_data(
     async def try_exchange(exchange_id: str, config: dict) -> Optional[pd.DataFrame]:
         """Try fetching from single exchange"""
         try:
-            config_json = json.dumps(config, sort_keys=True)
-            exchange = get_exchange_instance(exchange_id, config_json)
-            print(f"[CCXT] Trying {exchange_id}...")
+            exchange_class = getattr(ccxt, exchange_id)
+            exchange = exchange_class(config)
 
             # Try both pair formats
             for test_pair in [pair, pair_usdt]:
                 try:
-                    print(f"[CCXT] {exchange_id} - fetching {test_pair} {interval}")
-                    # Run in thread pool to avoid blocking
+                    # Pass since=None to get latest candles from exchange
                     ohlcv = await asyncio.to_thread(
-                        exchange.fetch_ohlcv, test_pair, interval, limit
+                        exchange.fetch_ohlcv,
+                        test_pair,
+                        interval,
+                        None,  # since=None for latest
+                        limit,
                     )
 
                     if not ohlcv:
-                        print(f"[CCXT] {exchange_id} - {test_pair} returned empty")
                         continue
 
                     # Fast DataFrame creation
@@ -191,21 +166,19 @@ async def fetch_ccxt_data(
                         ["Open", "High", "Low", "Close", "Volume"]
                     ].astype(float)
 
-                    print(f"[CCXT] {exchange_id} - SUCCESS! Got {len(df)} candles")
+                    # Slice to exact limit (some exchanges ignore limit param)
+                    df = df.tail(limit).reset_index(drop=True)
                     return df
 
-                except (ccxt.BaseError, Exception) as e:
-                    print(f"[CCXT] {exchange_id} - {test_pair} failed: {e}")
+                except (ccxt.BaseError, Exception):
                     continue
 
-        except Exception as e:
-            print(f"[CCXT] {exchange_id} - Exchange error: {e}")
+        except Exception:
             pass
 
         return None
 
     # Try exchanges in parallel with timeout
-    print(f"[CCXT] Starting parallel fetch for {symbol} {timeframe}")
     tasks = [
         try_exchange(exchange_id, config) for exchange_id, config in EXCHANGE_CONFIGS
     ]
@@ -218,166 +191,12 @@ async def fetch_ccxt_data(
         # Return first successful result
         for result in results:
             if isinstance(result, pd.DataFrame) and not result.empty:
-                print(f"[CCXT] Returning successful DataFrame")
                 return result
 
     except asyncio.TimeoutError:
-        print(f"[CCXT] Timeout after 15 seconds")
         pass
 
-    print(f"[CCXT] All exchanges failed for {symbol}")
     return None
-
-
-async def fetch_pyth_data(
-    symbol: str, timeframe: str, limit: int = 100
-) -> Optional[pd.DataFrame]:
-    """Fetch from Pyth Benchmarks API"""
-    if symbol not in PYTH_IDS:
-        return None
-
-    resolution_sec = TF_MAP_PYTH.get(timeframe.upper(), 3600)
-    now = int(datetime.now().timestamp())
-    start_time = now - (resolution_sec * limit)
-
-    # Resolution format for Pyth
-    if resolution_sec == 86400:
-        resolution_str = "1D"
-    elif resolution_sec == 604800:
-        resolution_str = "1W"
-    else:
-        resolution_str = str(resolution_sec // 60)
-
-    url = "https://benchmarks.pyth.network/v1/shims/tradingview/history"
-    params = {
-        "symbol": symbol,
-        "resolution": resolution_str,
-        "from": start_time,
-        "to": now,
-    }
-
-    try:
-        response = await asyncio.to_thread(
-            HTTP_SESSION.get, url, params=params, timeout=3
-        )
-
-        if response.status_code != 200:
-            return None
-
-        data = response.json()
-        if data.get("s") != "ok":
-            return None
-
-        # Fast DataFrame creation
-        df = pd.DataFrame(
-            {
-                "Date": pd.to_datetime(data["t"], unit="s"),
-                "Open": data["o"],
-                "High": data["h"],
-                "Low": data["l"],
-                "Close": data["c"],
-                "Volume": data.get("v", [0] * len(data["t"])),
-            }
-        )
-
-        return df
-
-    except Exception:
-        return None
-
-
-async def fetch_binance_direct(
-    symbol: str, timeframe: str, limit: int = 100
-) -> Optional[pd.DataFrame]:
-    """Direct Binance API call"""
-    pair = symbol.replace("/", "").replace("USD", "USDT")
-    tf_map = {"M15": "15m", "H1": "1h", "H4": "4h", "D": "1d", "W": "1w"}
-    interval = tf_map.get(timeframe.upper(), "1h")
-
-    url = "https://api.binance.com/api/v3/klines"
-    params = {"symbol": pair, "interval": interval, "limit": limit}
-
-    try:
-        response = await asyncio.to_thread(
-            HTTP_SESSION.get, url, params=params, timeout=3
-        )
-
-        if response.status_code != 200:
-            return None
-
-        data = response.json()
-
-        # Fast DataFrame with only needed columns
-        df = pd.DataFrame(
-            data,
-            columns=[
-                "Open Time",
-                "Open",
-                "High",
-                "Low",
-                "Close",
-                "Volume",
-                "_1",
-                "_2",
-                "_3",
-                "_4",
-                "_5",
-                "_6",
-            ],  # type: ignore[call-overload]
-        )
-        df["Date"] = pd.to_datetime(df["Open Time"], unit="ms")
-        df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
-
-        # Batch type conversion
-        df[["Open", "High", "Low", "Close", "Volume"]] = df[
-            ["Open", "High", "Low", "Close", "Volume"]
-        ].astype(float)
-
-        return df  # type: ignore[return-value]
-
-    except Exception:
-        return None
-
-
-def generate_mock_data(
-    periods: int = 100, freq: str = "1h", symbol: str = "BTC/USD"
-) -> pd.DataFrame:  # type: ignore[return]
-    """Generate mock data for fallback"""
-    # Convert timeframe to pandas frequency format
-    freq_map = {
-        "M1": "1min",
-        "M15": "15min",
-        "H1": "1h",
-        "H4": "4h",
-        "D": "1D",
-        "W": "1W",
-    }
-    pd_freq = freq_map.get(freq, "1h")
-    date_range = pd.date_range(end=datetime.now(), periods=periods, freq=pd_freq)
-
-    # Seed based on symbol
-    seed_val = sum(ord(c) for c in symbol)
-    np.random.seed(seed_val)
-
-    # Base price
-    base_prices = {"BTC": 50000, "ETH": 3000, "SOL": 150}
-    base_price = next((v for k, v in base_prices.items() if k in symbol), 100)
-
-    # Random walk
-    volatility = base_price * 0.02
-    price_changes = np.random.randn(periods) * volatility
-    price = np.maximum(base_price + np.cumsum(price_changes), 0.01)
-
-    return pd.DataFrame(
-        {
-            "Date": date_range,
-            "Open": price,
-            "High": price + np.random.rand(periods) * volatility,
-            "Low": price - np.random.rand(periods) * volatility,
-            "Close": price + np.random.randn(periods) * (volatility * 0.5),
-            "Volume": np.random.randint(100, 1000, size=periods),
-        }
-    )
 
 
 # ============================================================================
@@ -720,49 +539,24 @@ async def get_chart(
     indicators: Optional[str] = Query(
         None, description="Comma separated: vol, macd, rsi, ma:20, ma:50"
     ),
-    feed: str = Query("ccxt", description="Data feed source: ccxt, pyth, binance"),
 ):
-    """Generate chart with optimized caching and parallel fetching"""
+    """Generate chart with CCXT data from multiple exchanges"""
 
-    # Check cache first
-    cache_k = cache_key(symbol, timeframe, 100, feed)
+    cache_k = cache_key(symbol, timeframe, 100, "ccxt")
     df = get_cached_data(cache_k)
 
     if df is None:
-        # Fetch data based on feed parameter
-        feed_lower = feed.lower().strip()
+        df = await fetch_ccxt_data(symbol, timeframe, 100)
 
-        if feed_lower == "pyth":
-            df = await fetch_pyth_data(symbol, timeframe, 100)
-        elif feed_lower == "binance":
-            df = await fetch_binance_direct(symbol, timeframe, 100)
-        else:  # ccxt (default)
-            df = await fetch_ccxt_data(symbol, timeframe, 100)
-
-        # Fallback chain
-        # if df is None or df.empty:
-        #     if feed_lower != "pyth":
-        #         df = await fetch_pyth_data(symbol, timeframe, 100)
-
-        # if df is None or df.empty:
-        #     if feed_lower != "binance":
-        #         df = await fetch_binance_direct(symbol, timeframe, 100)
-
-        # if df is None or df.empty:
-        #     df = generate_mock_data(100, timeframe, symbol)
-
-        # Check if data fetch failed
         if df is None or df.empty:
             return Response(
-                content=f"Failed to fetch data from CCXT for {symbol}",
+                content=f"Failed to fetch data for {symbol}",
                 status_code=500,
                 media_type="text/plain",
             )
 
-        # Cache the result
         set_cached_data(cache_k, df)
 
-    # Generate chart
     img_bytes = await generate_chart(df, symbol, timeframe, indicators)
 
     return Response(content=img_bytes, media_type="image/png")
