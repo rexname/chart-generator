@@ -50,15 +50,15 @@ TF_MAP_PYTH = {
 EXCHANGE_CONFIGS = [
     (
         "binance",
-        {"enableRateLimit": True, "timeout": 3000, "options": {"defaultType": "spot"}},
+        {"enableRateLimit": True, "timeout": 10000, "options": {"defaultType": "spot"}},
     ),
     (
         "bybit",
-        {"enableRateLimit": True, "timeout": 3000, "options": {"defaultType": "spot"}},
+        {"enableRateLimit": True, "timeout": 10000, "options": {"defaultType": "spot"}},
     ),
     (
         "okx",
-        {"enableRateLimit": True, "timeout": 3000, "options": {"defaultType": "spot"}},
+        {"enableRateLimit": True, "timeout": 10000, "options": {"defaultType": "spot"}},
     ),
 ]
 
@@ -110,6 +110,8 @@ HTTP_SESSION = create_session()
 def get_exchange_instance(exchange_id: str, config_json: str):
     """Cache exchange instances to avoid re-initialization"""
     config = json.loads(config_json)
+    config["options"] = config.get("options", {})
+    config["options"]["loadMarkets"] = False  # Skip market metadata load
     exchange_class = getattr(ccxt, exchange_id)
     return exchange_class(config)
 
@@ -161,16 +163,19 @@ async def fetch_ccxt_data(
         try:
             config_json = json.dumps(config, sort_keys=True)
             exchange = get_exchange_instance(exchange_id, config_json)
+            print(f"[CCXT] Trying {exchange_id}...")
 
             # Try both pair formats
             for test_pair in [pair, pair_usdt]:
                 try:
+                    print(f"[CCXT] {exchange_id} - fetching {test_pair} {interval}")
                     # Run in thread pool to avoid blocking
                     ohlcv = await asyncio.to_thread(
                         exchange.fetch_ohlcv, test_pair, interval, limit
                     )
 
                     if not ohlcv:
+                        print(f"[CCXT] {exchange_id} - {test_pair} returned empty")
                         continue
 
                     # Fast DataFrame creation
@@ -186,34 +191,41 @@ async def fetch_ccxt_data(
                         ["Open", "High", "Low", "Close", "Volume"]
                     ].astype(float)
 
+                    print(f"[CCXT] {exchange_id} - SUCCESS! Got {len(df)} candles")
                     return df
 
-                except (ccxt.BaseError, Exception):
+                except (ccxt.BaseError, Exception) as e:
+                    print(f"[CCXT] {exchange_id} - {test_pair} failed: {e}")
                     continue
 
-        except Exception:
+        except Exception as e:
+            print(f"[CCXT] {exchange_id} - Exchange error: {e}")
             pass
 
         return None
 
     # Try exchanges in parallel with timeout
+    print(f"[CCXT] Starting parallel fetch for {symbol} {timeframe}")
     tasks = [
         try_exchange(exchange_id, config) for exchange_id, config in EXCHANGE_CONFIGS
     ]
 
     try:
         results = await asyncio.wait_for(
-            asyncio.gather(*tasks, return_exceptions=True), timeout=5.0
+            asyncio.gather(*tasks, return_exceptions=True), timeout=15.0
         )
 
         # Return first successful result
         for result in results:
             if isinstance(result, pd.DataFrame) and not result.empty:
+                print(f"[CCXT] Returning successful DataFrame")
                 return result
 
     except asyncio.TimeoutError:
+        print(f"[CCXT] Timeout after 15 seconds")
         pass
 
+    print(f"[CCXT] All exchanges failed for {symbol}")
     return None
 
 
@@ -728,16 +740,24 @@ async def get_chart(
             df = await fetch_ccxt_data(symbol, timeframe, 100)
 
         # Fallback chain
-        if df is None or df.empty:
-            if feed_lower != "pyth":
-                df = await fetch_pyth_data(symbol, timeframe, 100)
+        # if df is None or df.empty:
+        #     if feed_lower != "pyth":
+        #         df = await fetch_pyth_data(symbol, timeframe, 100)
 
-        if df is None or df.empty:
-            if feed_lower != "binance":
-                df = await fetch_binance_direct(symbol, timeframe, 100)
+        # if df is None or df.empty:
+        #     if feed_lower != "binance":
+        #         df = await fetch_binance_direct(symbol, timeframe, 100)
 
+        # if df is None or df.empty:
+        #     df = generate_mock_data(100, timeframe, symbol)
+
+        # Check if data fetch failed
         if df is None or df.empty:
-            df = generate_mock_data(100, timeframe, symbol)
+            return Response(
+                content=f"Failed to fetch data from CCXT for {symbol}",
+                status_code=500,
+                media_type="text/plain",
+            )
 
         # Cache the result
         set_cached_data(cache_k, df)
